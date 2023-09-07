@@ -27,6 +27,7 @@ import (
 	"k8s.io/node-problem-detector/pkg/exporters"
 	"k8s.io/node-problem-detector/pkg/exporters/k8sexporter"
 	"k8s.io/node-problem-detector/pkg/exporters/prometheusexporter"
+	"k8s.io/node-problem-detector/pkg/extendedmonitor/nodelifecycle"
 	"k8s.io/node-problem-detector/pkg/problemdaemon"
 	"k8s.io/node-problem-detector/pkg/problemdetector"
 	"k8s.io/node-problem-detector/pkg/types"
@@ -69,6 +70,9 @@ func npdMain(ctx context.Context, npdo *options.NodeProblemDetectorOptions) erro
 	if len(npdExporters) == 0 {
 		glog.Fatalf("No exporter is successfully setup")
 	}
+
+	// Initialize nodelifecycle
+	nodelifecycle.NewNodeMonitorOrDie(ctx, npdo)
 
 	// Initialize NPD core.
 	p := problemdetector.NewProblemDetector(problemDaemons, npdExporters)

@@ -15,6 +15,7 @@ import (
 
 	coordv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/klog"
 	"k8s.io/node-problem-detector/cmd/options"
 	"k8s.io/node-problem-detector/pkg/exporters/k8sexporter/problemclient"
+	"k8s.io/node-problem-detector/pkg/extendedmonitor/nodelifecycle/scheduler"
 )
 
 const (
@@ -52,12 +54,6 @@ const (
 
 	// The amount of time the nodecontroller should sleep between retrying node health updates
 	retrySleepTime = 20 * time.Millisecond
-	// NodeHealthUpdateRetry controls the number of retries of writing
-	// node health update.
-	NodeHealthUpdateRetry = 5
-	// TODO: configurable
-	nodeMonitorPeriod      = 5 * time.Second
-	nodeMonitorGracePeriod = 10 * time.Second
 )
 
 var (
@@ -128,6 +124,10 @@ type Controller struct {
 	nodesToRetry sync.Map
 	// per Node map storing last observed health together with a local time when it was observed.
 	nodeHealthMap *nodeHealthMap
+	// evictorLock protects zonePodEvictor and zoneNoExecuteTainter.
+	evictorLock sync.Mutex
+	// workers that are responsible for tainting nodes.
+	zoneNoExecuteTainter map[string]*scheduler.RateLimitedTimedQueue
 
 	// Value controlling Controller monitoring period, i.e. how often does Controller
 	// check node health signal posted from kubelet. This value should be lower than
@@ -269,6 +269,7 @@ func NewNodeLifecycleController(
 		now:                    metav1.Now,
 		nodeHealthMap:          newNodeHealthMap(),
 		recorder:               recorder,
+		zoneNoExecuteTainter:   make(map[string]*scheduler.RateLimitedTimedQueue),
 		nodesToRetry:           sync.Map{},
 		nodeMonitorPeriod:      nodeMonitorPeriod,
 		nodeMonitorGracePeriod: nodeMonitorGracePeriod,
@@ -325,6 +326,12 @@ func (nc *Controller) Run(ctx context.Context) {
 		return
 	}
 
+	if nc.runTaintManager {
+		// Handling taint based evictions. Because we don't want a dedicated logic in TaintManager for NC-originated
+		// taints, and we normally don't rate limit evictions caused by taints, we need to rate limit adding taints.
+		go wait.UntilWithContext(ctx, nc.doNoExecuteTaintingPass, scheduler.NodeEvictionPeriod)
+	}
+
 	// Incorporate the results of node health signal pushed from kubelet to master.
 	go wait.UntilWithContext(ctx, func(ctx context.Context) {
 		if err := nc.monitorNodeHealth(ctx); err != nil {
@@ -351,7 +358,7 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 		var observedReadyCondition v1.NodeCondition
 		var currentReadyCondition *v1.NodeCondition
 		node := nodes[i].DeepCopy()
-		if err := wait.PollImmediate(retrySleepTime, retrySleepTime*NodeHealthUpdateRetry, func() (bool, error) {
+		if err := wait.PollImmediate(retrySleepTime, retrySleepTime*scheduler.NodeHealthUpdateRetry, func() (bool, error) {
 			gracePeriod, observedReadyCondition, currentReadyCondition, err = nc.tryUpdateNodeHealth(ctx, node)
 			if err == nil {
 				return true, nil
@@ -407,6 +414,64 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (nc *Controller) doNoExecuteTaintingPass(ctx context.Context) {
+	// Extract out the keys of the map in order to not hold
+	// the evictorLock for the entire function and hold it
+	// only when nescessary.
+	var zoneNoExecuteTainterKeys []string
+	func() {
+		nc.evictorLock.Lock()
+		defer nc.evictorLock.Unlock()
+
+		zoneNoExecuteTainterKeys = make([]string, 0, len(nc.zoneNoExecuteTainter))
+		for k := range nc.zoneNoExecuteTainter {
+			zoneNoExecuteTainterKeys = append(zoneNoExecuteTainterKeys, k)
+		}
+	}()
+	for _, k := range zoneNoExecuteTainterKeys {
+		var zoneNoExecuteTainterWorker *scheduler.RateLimitedTimedQueue
+		func() {
+			nc.evictorLock.Lock()
+			defer nc.evictorLock.Unlock()
+			// Extracting the value without checking if the key
+			// exists or not is safe to do here since zones do
+			// not get removed, and consequently pod evictors for
+			// these zones also do not get removed, only added.
+			zoneNoExecuteTainterWorker = nc.zoneNoExecuteTainter[k]
+		}()
+		// Function should return 'false' and a time after which it should be retried, or 'true' if it shouldn't (it succeeded).
+		zoneNoExecuteTainterWorker.Try(func(value scheduler.TimedValue) (bool, time.Duration) {
+			node, err := nc.nodeLister.Get(value.Value)
+			if apierrors.IsNotFound(err) {
+				klog.Warningf("Node %v no longer present in nodeLister!", value.Value)
+				return true, 0
+			} else if err != nil {
+				klog.Warningf("Failed to get Node %v from the nodeLister: %v", value.Value, err)
+				// retry in 50 millisecond
+				return false, 50 * time.Millisecond
+			}
+			_, condition := GetNodeCondition(&node.Status, v1.NodeReady)
+			// Because we want to mimic NodeStatus.Condition["Ready"] we make "unreachable" and "not ready" taints mutually exclusive.
+			taintToAdd := v1.Taint{}
+			oppositeTaint := v1.Taint{}
+			switch condition.Status {
+			case v1.ConditionFalse:
+				taintToAdd = *NotReadyTaintTemplate
+				oppositeTaint = *UnreachableTaintTemplate
+			case v1.ConditionUnknown:
+				taintToAdd = *UnreachableTaintTemplate
+				oppositeTaint = *NotReadyTaintTemplate
+			default:
+				// It seems that the Node is ready again, so there's no need to taint it.
+				klog.V(4).Infof("Node %v was in a taint queue, but it's ready now. Ignoring taint request.", value.Value)
+				return true, 0
+			}
+			result := SwapNodeControllerTaint(ctx, nc.kubeClient, []*v1.Taint{&taintToAdd}, []*v1.Taint{&oppositeTaint}, node)
+			return result, 0
+		})
+	}
 }
 
 func (nc *Controller) processTaintBaseEviction(ctx context.Context, node *v1.Node, observedReadyCondition *v1.NodeCondition) {
@@ -658,27 +723,6 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 	return gracePeriod, observedReadyCondition, currentReadyCondition, nil
 }
 
-func (nc *Controller) doNoExecuteTaintingPass(ctx context.Context, node *v1.Node) bool {
-	_, condition := GetNodeCondition(&node.Status, v1.NodeReady)
-	// Because we want to mimic NodeStatus.Condition["Ready"] we make "unreachable" and "not ready" taints mutually exclusive.
-	taintToAdd := v1.Taint{}
-	oppositeTaint := v1.Taint{}
-	switch condition.Status {
-	case v1.ConditionFalse:
-		taintToAdd = *NotReadyTaintTemplate
-		oppositeTaint = *UnreachableTaintTemplate
-	case v1.ConditionUnknown:
-		taintToAdd = *UnreachableTaintTemplate
-		oppositeTaint = *NotReadyTaintTemplate
-	default:
-		// It seems that the Node is ready again, so there's no need to taint it.
-		klog.V(4).Infof("Node %v was in a taint queue, but it's ready now. Ignoring taint request.", node.Name)
-		return true
-	}
-
-	return SwapNodeControllerTaint(ctx, nc.kubeClient, []*v1.Taint{&taintToAdd}, []*v1.Taint{&oppositeTaint}, node)
-}
-
 func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, node *v1.Node) error {
 	// Map node's condition to Taints.
 	var taints []v1.Taint
@@ -743,23 +787,27 @@ func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.P
 }
 
 func (nc *Controller) markNodeForTainting(ctx context.Context, node *v1.Node, status v1.ConditionStatus) bool {
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
 	if status == v1.ConditionFalse {
 		if !TaintExists(node.Spec.Taints, NotReadyTaintTemplate) {
-			return true
+			nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name)
 		}
 	}
 
 	if status == v1.ConditionUnknown {
 		if !TaintExists(node.Spec.Taints, UnreachableTaintTemplate) {
-			return true
+			nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name)
 		}
 	}
+
+	nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Add(node.Name, string(node.UID))
 
 	if err := nc.doNoScheduleTaintingPass(ctx, node); err != nil {
 		return false
 	}
 
-	return nc.doNoExecuteTaintingPass(ctx, node)
+	return true
 }
 
 func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (bool, error) {
@@ -774,7 +822,10 @@ func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (b
 		return false, err
 	}
 
-	return true, nil
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
+
+	return nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name), nil
 }
 
 func getKubeClientConfig(uri *url.URL) (*kube_rest.Config, error) {

@@ -56,6 +56,7 @@ func MarkPodsNotReady(ctx context.Context, kubeClient clientset.Interface, recor
 
 		// Pod will be modified, so making copy is required.
 		pod := pods[i].DeepCopy()
+		pod.ResourceVersion = ""
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type == v1.PodReady {
 				cond.Status = v1.ConditionFalse

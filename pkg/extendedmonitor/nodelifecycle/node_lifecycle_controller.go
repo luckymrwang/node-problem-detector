@@ -224,7 +224,8 @@ func NewNodeMonitorOrDie(ctx context.Context, npdo *options.NodeProblemDetectorO
 	}
 
 	// we have checked it is a valid URI after command line argument is parsed.:)
-	uri, _ := url.Parse(npdo.ApiServerOverride)
+	// TODO: Avoid VIP floating, we use https://127.0.0.1:6443
+	uri, _ := url.Parse("https://127.0.0.1:6443")
 	cfg, err := getKubeClientConfig(uri)
 	if err != nil {
 		glog.Fatalf("Failed to get client config: %v", err)
@@ -240,14 +241,14 @@ func NewNodeMonitorOrDie(ctx context.Context, npdo *options.NodeProblemDetectorO
 		sharedInformers.Core().V1().Pods(),
 		sharedInformers.Core().V1().Nodes(),
 		clientset,
-		nodeMonitorPeriod,
-		nodeMonitorGracePeriod,
+		npdo.NodeMonitorPeriod,
+		npdo.NodeMonitorGracePeriod,
 	)
 	if err != nil {
 		glog.Errorf("Failed to get lifecycle controller: %v", err)
 		return
 	}
-	klog.Infof("Starting node controller")
+	klog.Infof("Starting node lifecycle monitor")
 	go sharedInformers.Start(wait.NeverStop)
 	go lifecycleController.Run(ctx)
 }
@@ -266,6 +267,7 @@ func NewNodeLifecycleController(
 	nc := &Controller{
 		kubeClient:             kubeClient,
 		now:                    metav1.Now,
+		nodeHealthMap:          newNodeHealthMap(),
 		recorder:               recorder,
 		nodesToRetry:           sync.Map{},
 		nodeMonitorPeriod:      nodeMonitorPeriod,

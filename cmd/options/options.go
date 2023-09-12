@@ -87,6 +87,15 @@ type NodeProblemDetectorOptions struct {
 
 	// NodeName is the node name used to communicate with Kubernetes ApiServer.
 	NodeName string
+
+	// nodeMonitorPeriod is the period for syncing NodeStatus in NodeController.
+	NodeMonitorPeriod time.Duration
+
+	// NodeMonitorGracePeriod is the amount of time which we allow a running node to be
+	// unresponsive before marking it unhealthy. Must be N times more than kubelet's
+	// nodeStatusUpdateFrequency, where N means number of retries allowed for kubelet
+	// to post node status.
+	NodeMonitorGracePeriod time.Duration
 }
 
 func NewNodeProblemDetectorOptions() *NodeProblemDetectorOptions {
@@ -125,6 +134,11 @@ func (npdo *NodeProblemDetectorOptions) AddFlags(fs *pflag.FlagSet) {
 		20257, "The port to bind the Prometheus scrape endpoint. Prometheus exporter is enabled by default at port 20257. Use 0 to disable.")
 	fs.StringVar(&npdo.PrometheusServerAddress, "prometheus-address",
 		"127.0.0.1", "The address to bind the Prometheus scrape endpoint.")
+	fs.DurationVar(&npdo.NodeMonitorPeriod, "node-monitor-period", time.Duration(5)*time.Second,
+		"The period for syncing NodeStatus in NodeController.")
+	fs.DurationVar(&npdo.NodeMonitorGracePeriod, "node-monitor-grace-period", time.Duration(10)*time.Second, "Amount of time which we allow running Node to be unresponsive before marking it unhealthy. "+
+		"Must be N times more than kubelet's nodeStatusUpdateFrequency, "+
+		"where N means number of retries allowed for kubelet to post node status.")
 	for _, exporterName := range exporters.GetExporterNames() {
 		exporterHandler := exporters.GetExporterHandlerOrDie(exporterName)
 		exporterHandler.Options.SetFlags(fs)

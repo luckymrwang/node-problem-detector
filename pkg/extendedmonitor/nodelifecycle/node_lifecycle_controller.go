@@ -58,6 +58,10 @@ const (
 	// nodeEvictionRate is the number of nodes per second on which pods are deleted in case of node failure when a zone is healthy
 	nodeEvictionRate = 0.1
 
+	// podUpdateWorkerSizes assumes that in most cases pod will be handled by monitorNodeHealth pass.
+	// Pod update workers will only handle lagging cache pods. 4 workers should be enough.
+	podUpdateWorkerSize = 4
+
 	// The amount of time the nodecontroller should sleep between retrying node health updates
 	retrySleepTime = 20 * time.Millisecond
 )
@@ -108,6 +112,11 @@ var (
 		v1.TaintNodePIDPressure:        v1.NodePIDPressure,
 	}
 )
+
+type podUpdateItem struct {
+	namespace string
+	name      string
+}
 
 // Controller is the controller that manages node's life cycle.
 type Controller struct {
@@ -173,6 +182,7 @@ type Controller struct {
 	runTaintManager bool
 
 	nodeUpdateQueue workqueue.Interface
+	podUpdateQueue  workqueue.RateLimitingInterface
 }
 
 type nodeHealthData struct {
@@ -284,8 +294,37 @@ func NewNodeLifecycleController(
 		nodeStartupGracePeriod: nodeMonitorGracePeriod,
 		runTaintManager:        true,
 		nodeUpdateQueue:        workqueue.NewNamed("node_lifecycle_controller"),
+		podUpdateQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node_lifecycle_controller_pods"),
 	}
 
+	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod := obj.(*v1.Pod)
+			nc.podUpdated(nil, pod)
+		},
+		UpdateFunc: func(prev, obj interface{}) {
+			prevPod := prev.(*v1.Pod)
+			newPod := obj.(*v1.Pod)
+			nc.podUpdated(prevPod, newPod)
+		},
+		DeleteFunc: func(obj interface{}) {
+			pod, isPod := obj.(*v1.Pod)
+			// We can get DeletedFinalStateUnknown instead of *v1.Pod here and we need to handle that correctly.
+			if !isPod {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					klog.Errorf("Received unexpected object: %v", obj)
+					return
+				}
+				pod, ok = deletedState.Obj.(*v1.Pod)
+				if !ok {
+					klog.Errorf("DeletedFinalStateUnknown contained non-Pod object: %v", deletedState.Obj)
+					return
+				}
+			}
+			nc.podUpdated(pod, nil)
+		},
+	})
 	nc.podInformerSynced = podInformer.Informer().HasSynced
 	podInformer.Informer().AddIndexers(cache.Indexers{
 		nodeNameKeyIndex: func(obj interface{}) ([]string, error) {
@@ -351,6 +390,10 @@ func (nc *Controller) Run(ctx context.Context) {
 	defer klog.Infof("Shutting down node controller")
 	if !cache.WaitForNamedCacheSync("taint", ctx.Done(), nc.leaseInformerSynced, nc.nodeInformerSynced, nc.podInformerSynced) {
 		return
+	}
+
+	for i := 0; i < podUpdateWorkerSize; i++ {
+		go wait.UntilWithContext(ctx, nc.doPodProcessingWorker, time.Second)
 	}
 
 	if nc.runTaintManager {
@@ -825,6 +868,90 @@ func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName str
 		return fmt.Errorf("failed to swap taints of node %+v", node)
 	}
 	return nil
+}
+
+func (nc *Controller) podUpdated(oldPod, newPod *v1.Pod) {
+	if newPod == nil {
+		return
+	}
+	if len(newPod.Spec.NodeName) != 0 && (oldPod == nil || newPod.Spec.NodeName != oldPod.Spec.NodeName) {
+		podItem := podUpdateItem{newPod.Namespace, newPod.Name}
+		nc.podUpdateQueue.Add(podItem)
+	}
+}
+
+func (nc *Controller) doPodProcessingWorker(ctx context.Context) {
+	for {
+		obj, shutdown := nc.podUpdateQueue.Get()
+		// "podUpdateQueue" will be shutdown when "stopCh" closed;
+		// we do not need to re-check "stopCh" again.
+		if shutdown {
+			return
+		}
+
+		podItem := obj.(podUpdateItem)
+		nc.processPod(ctx, podItem)
+	}
+}
+
+// processPod is processing events of assigning pods to nodes. In particular:
+// 1. for NodeReady=true node, taint eviction for this pod will be cancelled
+// 2. for NodeReady=false or unknown node, taint eviction of pod will happen and pod will be marked as not ready
+// 3. if node doesn't exist in cache, it will be skipped and handled later by doEvictionPass
+func (nc *Controller) processPod(ctx context.Context, podItem podUpdateItem) {
+	defer nc.podUpdateQueue.Done(podItem)
+	pod, err := nc.podLister.Pods(podItem.namespace).Get(podItem.name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// If the pod was deleted, there is no need to requeue.
+			return
+		}
+		klog.Warningf("Failed to read pod %v/%v: %v.", podItem.namespace, podItem.name, err)
+		nc.podUpdateQueue.AddRateLimited(podItem)
+		return
+	}
+
+	nodeName := pod.Spec.NodeName
+
+	nodeHealth := nc.nodeHealthMap.getDeepCopy(nodeName)
+	if nodeHealth == nil {
+		// Node data is not gathered yet or node has beed removed in the meantime.
+		// Pod will be handled by doEvictionPass method.
+		return
+	}
+
+	node, err := nc.nodeLister.Get(nodeName)
+	if err != nil {
+		klog.Warningf("Failed to read node %v: %v.", nodeName, err)
+		nc.podUpdateQueue.AddRateLimited(podItem)
+		return
+	}
+
+	_, currentReadyCondition := GetNodeCondition(nodeHealth.status, v1.NodeReady)
+	if currentReadyCondition == nil {
+		// Lack of NodeReady condition may only happen after node addition (or if it will be maliciously deleted).
+		// In both cases, the pod will be handled correctly (evicted if needed) during processing
+		// of the next node update event.
+		return
+	}
+
+	pods := []*v1.Pod{pod}
+	// In taint-based eviction mode, only node updates are processed by NodeLifecycleController.
+	// Pods are processed by TaintManager.
+	if !nc.runTaintManager {
+		if err := nc.processNoTaintBaseEviction(ctx, node, currentReadyCondition, nc.nodeMonitorGracePeriod, pods); err != nil {
+			klog.Warningf("Unable to process pod %+v eviction from node %v: %v.", podItem, nodeName, err)
+			nc.podUpdateQueue.AddRateLimited(podItem)
+			return
+		}
+	}
+
+	if currentReadyCondition.Status != v1.ConditionTrue {
+		if err := MarkPodsNotReady(ctx, nc.kubeClient, nc.recorder, pods, nodeName); err != nil {
+			klog.Warningf("Unable to mark pod %+v NotReady on node %v: %v.", podItem, nodeName, err)
+			nc.podUpdateQueue.AddRateLimited(podItem)
+		}
+	}
 }
 
 // evictPods:

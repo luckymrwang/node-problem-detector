@@ -35,11 +35,13 @@ import (
 	kubeClientCmd "k8s.io/client-go/tools/clientcmd"
 	kubeClientCmdApi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog"
 	"k8s.io/node-problem-detector/cmd/options"
 	"k8s.io/node-problem-detector/pkg/exporters/k8sexporter/problemclient"
 	"k8s.io/node-problem-detector/pkg/extendedmonitor/nodelifecycle/scheduler"
+	"k8s.io/node-problem-detector/pkg/extendedmonitor/nodelifecycle/workqueue"
 )
 
 const (
@@ -51,6 +53,10 @@ const (
 
 	nodeNameKeyIndex = "spec.nodeName"
 	masterLabelKey   = "node-role.kubernetes.io/master"
+	zoneKey          = "kubernetes.io/hostname"
+
+	// nodeEvictionRate is the number of nodes per second on which pods are deleted in case of node failure when a zone is healthy
+	nodeEvictionRate = 0.1
 
 	// The amount of time the nodecontroller should sleep between retrying node health updates
 	retrySleepTime = 20 * time.Millisecond
@@ -165,6 +171,8 @@ type Controller struct {
 	// if set to true Controller will start TaintManager that will evict Pods from
 	// tainted nodes, if they're not tolerated.
 	runTaintManager bool
+
+	nodeUpdateQueue workqueue.Interface
 }
 
 type nodeHealthData struct {
@@ -274,6 +282,8 @@ func NewNodeLifecycleController(
 		nodeMonitorPeriod:      nodeMonitorPeriod,
 		nodeMonitorGracePeriod: nodeMonitorGracePeriod,
 		nodeStartupGracePeriod: nodeMonitorGracePeriod,
+		runTaintManager:        true,
+		nodeUpdateQueue:        workqueue.NewNamed("node_lifecycle_controller"),
 	}
 
 	nc.podInformerSynced = podInformer.Informer().HasSynced
@@ -306,6 +316,23 @@ func NewNodeLifecycleController(
 		}
 		return pods, nil
 	}
+
+	klog.Infof("Controller will reconcile labels.")
+	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: CreateAddNodeHandler(func(node *v1.Node) error {
+			nc.nodeUpdateQueue.Add(node.Name)
+			return nil
+		}),
+		UpdateFunc: CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
+			nc.nodeUpdateQueue.Add(newNode.Name)
+			return nil
+		}),
+		DeleteFunc: CreateDeleteNodeHandler(func(node *v1.Node) error {
+			nc.nodesToRetry.Delete(node.Name)
+			return nil
+		}),
+	})
+
 	nc.podLister = podInformer.Lister()
 	nc.nodeLister = nodeInformer.Lister()
 
@@ -352,6 +379,10 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	nc.zoneNoExecuteTainter[zoneKey] =
+		scheduler.NewRateLimitedTimedQueue(
+			flowcontrol.NewTokenBucketRateLimiter(nodeEvictionRate, scheduler.EvictionRateLimiterBurst))
 
 	for i := range nodes {
 		var gracePeriod time.Duration
@@ -485,7 +516,7 @@ func (nc *Controller) processTaintBaseEviction(ctx context.Context, node *v1.Nod
 			if !SwapNodeControllerTaint(ctx, nc.kubeClient, []*v1.Taint{&taintToAdd}, []*v1.Taint{UnreachableTaintTemplate}, node) {
 				klog.Errorf("Failed to instantly swap UnreachableTaint to NotReadyTaint. Will try again in the next cycle.")
 			}
-		} else if nc.markNodeForTainting(ctx, node, v1.ConditionFalse) {
+		} else if nc.markNodeForTainting(node, v1.ConditionFalse) {
 			klog.V(2).Infof("Node %v is NotReady as of %v. Adding it to the Taint queue.",
 				node.Name,
 				decisionTimestamp,
@@ -498,7 +529,7 @@ func (nc *Controller) processTaintBaseEviction(ctx context.Context, node *v1.Nod
 			if !SwapNodeControllerTaint(ctx, nc.kubeClient, []*v1.Taint{&taintToAdd}, []*v1.Taint{NotReadyTaintTemplate}, node) {
 				klog.Errorf("Failed to instantly swap NotReadyTaint to UnreachableTaint. Will try again in the next cycle.")
 			}
-		} else if nc.markNodeForTainting(ctx, node, v1.ConditionUnknown) {
+		} else if nc.markNodeForTainting(node, v1.ConditionUnknown) {
 			klog.V(2).Infof("Node %v is unresponsive as of %v. Adding it to the Taint queue.",
 				node.Name,
 				decisionTimestamp,
@@ -557,6 +588,24 @@ func (nc *Controller) processNoTaintBaseEviction(ctx context.Context, node *v1.N
 		// TODO: scheduler handle
 	}
 	return nil
+}
+
+func (nc *Controller) doNodeProcessingPassWorker(ctx context.Context) {
+	for {
+		obj, shutdown := nc.nodeUpdateQueue.Get()
+		// "nodeUpdateQueue" will be shutdown when "stopCh" closed;
+		// we do not need to re-check "stopCh" again.
+		if shutdown {
+			return
+		}
+		nodeName := obj.(string)
+		if err := nc.doNoScheduleTaintingPass(ctx, nodeName); err != nil {
+			klog.Errorf("Failed to taint NoSchedule on node <%s>, requeue it: %v", nodeName, err)
+			// TODO(k82cn): Add nodeName back to the queue
+		}
+
+		nc.nodeUpdateQueue.Done(nodeName)
+	}
 }
 
 // tryUpdateNodeHealth checks a given node's conditions and tries to update it. Returns grace period to
@@ -723,7 +772,16 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 	return gracePeriod, observedReadyCondition, currentReadyCondition, nil
 }
 
-func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, node *v1.Node) error {
+func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName string) error {
+	node, err := nc.nodeLister.Get(nodeName)
+	if err != nil {
+		// If node not found, just ignore it.
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
 	// Map node's condition to Taints.
 	var taints []v1.Taint
 	for _, condition := range node.Status.Conditions {
@@ -766,7 +824,6 @@ func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, node *v1.Nod
 	if !SwapNodeControllerTaint(ctx, nc.kubeClient, taintsToAdd, taintsToDel, node) {
 		return fmt.Errorf("failed to swap taints of node %+v", node)
 	}
-
 	return nil
 }
 
@@ -786,28 +843,22 @@ func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.P
 	return false, nil
 }
 
-func (nc *Controller) markNodeForTainting(ctx context.Context, node *v1.Node, status v1.ConditionStatus) bool {
+func (nc *Controller) markNodeForTainting(node *v1.Node, status v1.ConditionStatus) bool {
 	nc.evictorLock.Lock()
 	defer nc.evictorLock.Unlock()
 	if status == v1.ConditionFalse {
 		if !TaintExists(node.Spec.Taints, NotReadyTaintTemplate) {
-			nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name)
+			nc.zoneNoExecuteTainter[zoneKey].Remove(node.Name)
 		}
 	}
 
 	if status == v1.ConditionUnknown {
 		if !TaintExists(node.Spec.Taints, UnreachableTaintTemplate) {
-			nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name)
+			nc.zoneNoExecuteTainter[zoneKey].Remove(node.Name)
 		}
 	}
 
-	nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Add(node.Name, string(node.UID))
-
-	if err := nc.doNoScheduleTaintingPass(ctx, node); err != nil {
-		return false
-	}
-
-	return true
+	return nc.zoneNoExecuteTainter[zoneKey].Add(node.Name, string(node.UID))
 }
 
 func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (bool, error) {
@@ -825,7 +876,7 @@ func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (b
 	nc.evictorLock.Lock()
 	defer nc.evictorLock.Unlock()
 
-	return nc.zoneNoExecuteTainter["kubernetes.io/hostname"].Remove(node.Name), nil
+	return nc.zoneNoExecuteTainter[zoneKey].Remove(node.Name), nil
 }
 
 func getKubeClientConfig(uri *url.URL) (*kube_rest.Config, error) {
@@ -899,4 +950,51 @@ func getConfigOverrides(uri *url.URL) (*kubeClientCmd.ConfigOverrides, error) {
 	}
 
 	return &kubeConfigOverride, nil
+}
+
+// CreateAddNodeHandler creates an add node handler.
+func CreateAddNodeHandler(f func(node *v1.Node) error) func(obj interface{}) {
+	return func(originalObj interface{}) {
+		node := originalObj.(*v1.Node).DeepCopy()
+		if err := f(node); err != nil {
+			utilruntime.HandleError(fmt.Errorf("Error while processing Node Add: %v", err))
+		}
+	}
+}
+
+// CreateUpdateNodeHandler creates a node update handler. (Common to lifecycle and ipam)
+func CreateUpdateNodeHandler(f func(oldNode, newNode *v1.Node) error) func(oldObj, newObj interface{}) {
+	return func(origOldObj, origNewObj interface{}) {
+		node := origNewObj.(*v1.Node).DeepCopy()
+		prevNode := origOldObj.(*v1.Node).DeepCopy()
+
+		if err := f(prevNode, node); err != nil {
+			utilruntime.HandleError(fmt.Errorf("Error while processing Node Add/Delete: %v", err))
+		}
+	}
+}
+
+// CreateDeleteNodeHandler creates a delete node handler. (Common to lifecycle and ipam)
+func CreateDeleteNodeHandler(f func(node *v1.Node) error) func(obj interface{}) {
+	return func(originalObj interface{}) {
+		originalNode, isNode := originalObj.(*v1.Node)
+		// We can get DeletedFinalStateUnknown instead of *v1.Node here and
+		// we need to handle that correctly. #34692
+		if !isNode {
+			deletedState, ok := originalObj.(cache.DeletedFinalStateUnknown)
+			if !ok {
+				klog.Errorf("Received unexpected object %v", originalObj)
+				return
+			}
+			originalNode, ok = deletedState.Obj.(*v1.Node)
+			if !ok {
+				klog.Errorf("DeletedFinalStateUnknown contained non-Node object %v", deletedState.Obj)
+				return
+			}
+		}
+		node := originalNode.DeepCopy()
+		if err := f(node); err != nil {
+			utilruntime.HandleError(fmt.Errorf("Error while processing Node Add/Delete: %v", err))
+		}
+	}
 }

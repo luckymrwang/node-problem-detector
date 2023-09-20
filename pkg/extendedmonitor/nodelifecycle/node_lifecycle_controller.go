@@ -432,9 +432,11 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 		return err
 	}
 
-	nc.zoneNoExecuteTainter[zoneKey] =
-		scheduler.NewRateLimitedTimedQueue(
-			flowcontrol.NewTokenBucketRateLimiter(nodeEvictionRate, scheduler.EvictionRateLimiterBurst))
+	if _, ok := nc.zoneNoExecuteTainter[zoneKey]; !ok {
+		nc.zoneNoExecuteTainter[zoneKey] =
+			scheduler.NewRateLimitedTimedQueue(
+				flowcontrol.NewTokenBucketRateLimiter(nodeEvictionRate, scheduler.EvictionRateLimiterBurst))
+	}
 
 	for i := range nodes {
 		var gracePeriod time.Duration
@@ -552,6 +554,13 @@ func (nc *Controller) doNoExecuteTaintingPass(ctx context.Context) {
 				return true, 0
 			}
 			result := SwapNodeControllerTaint(ctx, nc.kubeClient, []*v1.Taint{&taintToAdd}, []*v1.Taint{&oppositeTaint}, node)
+			if result {
+				// mark pod not-ready
+				pods, err := nc.getPodsAssignedToNode(node.Name)
+				if err = MarkPodsNotReady(ctx, nc.kubeClient, nc.recorder, pods, node.Name); err != nil {
+					utilruntime.HandleError(fmt.Errorf("unable to mark all pods NotReady on node %v: %v; doNoExecuteTaintingPass", node.Name, err))
+				}
+			}
 			return result, 0
 		})
 	}

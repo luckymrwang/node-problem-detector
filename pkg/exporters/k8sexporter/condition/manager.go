@@ -26,10 +26,10 @@ import (
 	"k8s.io/node-problem-detector/pkg/types"
 	problemutil "k8s.io/node-problem-detector/pkg/util"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/clock"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/utils/clock"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -68,7 +68,7 @@ type conditionManager struct {
 	// No lock is needed in `sync`, because it is in the same goroutine with the
 	// write operation.
 	sync.RWMutex
-	clock        clock.Clock
+	clock        clock.WithTicker
 	latestTry    time.Time
 	resyncNeeded bool
 	client       problemclient.Client
@@ -79,10 +79,10 @@ type conditionManager struct {
 }
 
 // NewConditionManager creates a condition manager.
-func NewConditionManager(client problemclient.Client, clock clock.Clock, heartbeatPeriod time.Duration) ConditionManager {
+func NewConditionManager(client problemclient.Client, clockInUse clock.WithTicker, heartbeatPeriod time.Duration) ConditionManager {
 	return &conditionManager{
 		client:          client,
-		clock:           clock,
+		clock:           clockInUse,
 		updates:         make(map[string]types.Condition),
 		conditions:      make(map[string]types.Condition),
 		heartbeatPeriod: heartbeatPeriod,
@@ -162,7 +162,7 @@ func (c *conditionManager) sync(ctx context.Context) {
 	}
 	if err := c.client.SetConditions(ctx, conditions); err != nil {
 		// The conditions will be updated again in future sync
-		glog.Errorf("failed to update node conditions: %v", err)
+		klog.Errorf("failed to update node conditions: %v", err)
 		c.resyncNeeded = true
 		return
 	}

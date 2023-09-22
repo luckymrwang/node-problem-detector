@@ -21,9 +21,8 @@ import (
 	"strings"
 	"time"
 
-	utilclock "code.cloudfoundry.org/clock"
 	"github.com/euank/go-kmsg-parser/kmsgparser"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/node-problem-detector/pkg/systemlogmonitor/logwatchers/types"
 	logtypes "k8s.io/node-problem-detector/pkg/systemlogmonitor/types"
@@ -38,18 +37,17 @@ type kernelLogWatcher struct {
 	tomb      *tomb.Tomb
 
 	kmsgParser kmsgparser.Parser
-	clock      utilclock.Clock
 }
 
 // NewKmsgWatcher creates a watcher which will read messages from /dev/kmsg
 func NewKmsgWatcher(cfg types.WatcherConfig) types.LogWatcher {
 	uptime, err := util.GetUptimeDuration()
 	if err != nil {
-		glog.Fatalf("failed to get uptime: %v", err)
+		klog.Fatalf("failed to get uptime: %v", err)
 	}
 	startTime, err := util.GetStartTime(time.Now(), uptime, cfg.Lookback, cfg.Delay)
 	if err != nil {
-		glog.Fatalf("failed to get start time: %v", err)
+		klog.Fatalf("failed to get start time: %v", err)
 	}
 
 	return &kernelLogWatcher{
@@ -58,7 +56,6 @@ func NewKmsgWatcher(cfg types.WatcherConfig) types.LogWatcher {
 		tomb:      tomb.NewTomb(),
 		// Arbitrary capacity
 		logCh: make(chan *logtypes.Log, 100),
-		clock: utilclock.NewClock(),
 	}
 }
 
@@ -89,7 +86,7 @@ func (k *kernelLogWatcher) watchLoop() {
 	kmsgs := k.kmsgParser.Parse()
 	defer func() {
 		if err := k.kmsgParser.Close(); err != nil {
-			glog.Errorf("Failed to close kmsg parser: %v", err)
+			klog.Errorf("Failed to close kmsg parser: %v", err)
 		}
 		close(k.logCh)
 		k.tomb.Done()
@@ -98,21 +95,21 @@ func (k *kernelLogWatcher) watchLoop() {
 	for {
 		select {
 		case <-k.tomb.Stopping():
-			glog.Infof("Stop watching kernel log")
+			klog.Infof("Stop watching kernel log")
 			return
 		case msg, ok := <-kmsgs:
 			if !ok {
-				glog.Error("Kmsg channel closed")
+				klog.Error("Kmsg channel closed")
 				return
 			}
-			glog.V(5).Infof("got kernel message: %+v", msg)
+			klog.V(5).Infof("got kernel message: %+v", msg)
 			if msg.Message == "" {
 				continue
 			}
 
 			// Discard messages before start time.
 			if msg.Timestamp.Before(k.startTime) {
-				glog.V(5).Infof("Throwing away msg %q before start time: %v < %v", msg.Message, msg.Timestamp, k.startTime)
+				klog.V(5).Infof("Throwing away msg %q before start time: %v < %v", msg.Message, msg.Timestamp, k.startTime)
 				continue
 			}
 

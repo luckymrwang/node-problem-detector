@@ -71,14 +71,14 @@ else ifeq ($(shell go env GOHOSTOS), windows)
 ENABLE_JOURNALD=0
 endif
 
-# TODO(random-liu): Support different architectures.
-# The debian-base:v2.0.0 image built from kubernetes repository is based on
-# Debian Stretch. It includes systemd 241 with support for both +XZ and +LZ4
-# compression. +LZ4 is needed on some os distros such as COS.
-BASEIMAGE:=registry.k8s.io/build-image/debian-base:bullseye-v1.4.3
+# Set default base image to Debian 12 (Bookworm)
+BASEIMAGE:=registry.k8s.io/build-image/debian-base:bookworm-v1.0.0
 
 # Disable cgo by default to make the binary statically linked.
 CGO_ENABLED:=0
+
+# Set default Go architecture to AMD64.
+GOARCH ?= amd64
 
 # Construct the "-tags" parameter used by "go build".
 BUILD_TAGS?=
@@ -109,9 +109,9 @@ else
 endif
 
 vet:
-	GO111MODULE=on go list -mod vendor -tags "$(HOST_PLATFORM_BUILD_TAGS)" ./... | \
+	go list -tags "$(HOST_PLATFORM_BUILD_TAGS)" ./... | \
 		grep -v "./vendor/*" | \
-		GO111MODULE=on xargs go vet -mod vendor -tags "$(HOST_PLATFORM_BUILD_TAGS)"
+		xargs go vet -tags "$(HOST_PLATFORM_BUILD_TAGS)"
 
 fmt:
 	find . -type f -name "*.go" | grep -v "./vendor/*" | xargs gofmt -s -w -l
@@ -131,8 +131,7 @@ ALL_BINARIES = $(foreach binary, $(BINARIES) $(BINARIES_LINUX_ONLY), ./$(binary)
 ALL_TARBALLS = $(foreach platform, $(PLATFORMS), $(NPD_NAME_VERSION)-$(platform).tar.gz)
 
 output/windows_amd64/bin/%.exe: $(PKG_SOURCES)
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on go build \
-		-mod vendor \
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) go build \
 		-o $@ \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(WINDOWS_BUILD_TAGS)" \
@@ -140,16 +139,15 @@ output/windows_amd64/bin/%.exe: $(PKG_SOURCES)
 	touch $@
 
 output/windows_amd64/test/bin/%.exe: $(PKG_SOURCES)
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on go build \
-		-mod vendor \
-		-o $@ \
+	cd test && \
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) go build \
+		-o ../$@ \
 		-tags "$(WINDOWS_BUILD_TAGS)" \
-		./test/e2e/$(subst -,,$*)
+		./e2e/$(subst -,,$*)
 
 output/linux_amd64/bin/%: $(PKG_SOURCES)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on \
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) \
 	  CC=x86_64-linux-gnu-gcc go build \
-		-mod vendor \
 		-o $@ \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(LINUX_BUILD_TAGS)" \
@@ -157,17 +155,16 @@ output/linux_amd64/bin/%: $(PKG_SOURCES)
 	touch $@
 
 output/linux_amd64/test/bin/%: $(PKG_SOURCES)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on \
+	cd test && \
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CGO_ENABLED) \
 	  CC=x86_64-linux-gnu-gcc go build \
-		-mod vendor \
-		-o $@ \
+		-o ../$@ \
 		-tags "$(LINUX_BUILD_TAGS)" \
-		./test/e2e/$(subst -,,$*)
+		./e2e/$(subst -,,$*)
 
 output/linux_arm64/bin/%: $(PKG_SOURCES)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on \
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=$(CGO_ENABLED) \
 	  CC=aarch64-linux-gnu-gcc go build \
-		-mod vendor \
 		-o $@ \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(LINUX_BUILD_TAGS)" \
@@ -175,18 +172,17 @@ output/linux_arm64/bin/%: $(PKG_SOURCES)
 	touch $@
 
 output/linux_arm64/test/bin/%: $(PKG_SOURCES)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=$(CGO_ENABLED) GO111MODULE=on \
+	cd test && \
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=$(CGO_ENABLED) \
 	  CC=aarch64-linux-gnu-gcc go build \
-		-mod vendor \
-		-o $@ \
+		-o ../$@ \
 		-tags "$(LINUX_BUILD_TAGS)" \
-		./test/e2e/$(subst -,,$*)
+		./e2e/$(subst -,,$*)
 
 # In the future these targets should be deprecated.
 ./bin/log-counter: $(PKG_SOURCES)
 ifeq ($(ENABLE_JOURNALD), 1)
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GO111MODULE=on go build \
-		-mod vendor \
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=$(GOARCH) go build \
 		-o bin/log-counter \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(LINUX_BUILD_TAGS)" \
@@ -196,38 +192,37 @@ else
 endif
 
 ./bin/node-problem-detector: $(PKG_SOURCES)
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GO111MODULE=on go build \
-		-mod vendor \
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=$(GOARCH) go build \
 		-o bin/node-problem-detector \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(LINUX_BUILD_TAGS)" \
 		./cmd/nodeproblemdetector
 
 ./test/bin/problem-maker: $(PKG_SOURCES)
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GO111MODULE=on go build \
-		-mod vendor \
-		-o test/bin/problem-maker \
+	cd test && \
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=$(GOARCH) go build \
+		-o bin/problem-maker \
 		-tags "$(LINUX_BUILD_TAGS)" \
-		./test/e2e/problemmaker/problem_maker.go
+		./e2e/problemmaker/problem_maker.go
 
 ./bin/health-checker: $(PKG_SOURCES)
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GO111MODULE=on go build \
-		-mod vendor \
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=$(GOARCH) go build \
 		-o bin/health-checker \
 		-ldflags '-X $(PKG)/pkg/version.version=$(VERSION)' \
 		-tags "$(LINUX_BUILD_TAGS)" \
 		cmd/healthchecker/health_checker.go
 
 test: vet fmt
-	GO111MODULE=on go test -mod vendor -timeout=1m -v -race -short -tags "$(HOST_PLATFORM_BUILD_TAGS)" ./...
+	go test -timeout=1m -v -race -short -tags "$(HOST_PLATFORM_BUILD_TAGS)" ./...
 
 e2e-test: vet fmt build-tar
-	GO111MODULE=on go run github.com/onsi/ginkgo/ginkgo -nodes=$(PARALLEL) -mod vendor -timeout=10m -v -tags "$(HOST_PLATFORM_BUILD_TAGS)" -stream \
-	./test/e2e/metriconly/... -- \
+	cd test && \
+	go run github.com/onsi/ginkgo/ginkgo -nodes=$(PARALLEL) -timeout=10m -v -tags "$(HOST_PLATFORM_BUILD_TAGS)" -stream \
+	./e2e/metriconly/... -- \
 	-project=$(PROJECT) -zone=$(ZONE) \
 	-image=$(VM_IMAGE) -image-family=$(IMAGE_FAMILY) -image-project=$(IMAGE_PROJECT) \
 	-ssh-user=$(SSH_USER) -ssh-key=$(SSH_KEY) \
-	-npd-build-tar=`pwd`/$(TARBALL) \
+	-npd-build-tar=`pwd`/../$(TARBALL) \
 	-boskos-project-type=$(BOSKOS_PROJECT_TYPE) -job-name=$(JOB_NAME) \
 	-artifacts-dir=$(ARTIFACTS)
 
@@ -241,8 +236,7 @@ $(NPD_NAME_VERSION)-%.tar.gz: $(ALL_BINARIES) test/e2e-install.sh
 build-binaries: $(ALL_BINARIES)
 
 build-container: clean Dockerfile
-	docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-	docker buildx create --use
+	docker buildx create --platform $(DOCKER_PLATFORMS) --use
 	docker buildx build --platform $(DOCKER_PLATFORMS) -t $(IMAGE) --build-arg BASEIMAGE=$(BASEIMAGE) --build-arg LOGCOUNTER=$(LOGCOUNTER) .
 
 $(TARBALL): ./bin/node-problem-detector ./bin/log-counter ./bin/health-checker ./test/bin/problem-maker
@@ -268,7 +262,6 @@ ifneq (,$(findstring gcr.io,$(REGISTRY)))
 	gcloud auth configure-docker
 endif
 	# Build should be cached from build-container
-	docker buildx create --use
 	docker buildx build --push --platform $(DOCKER_PLATFORMS) -t $(IMAGE) --build-arg BASEIMAGE=$(BASEIMAGE) --build-arg LOGCOUNTER=$(LOGCOUNTER) .
 
 push-tar: build-tar
@@ -279,7 +272,7 @@ push: push-container push-tar
 
 coverage.out:
 	rm -f coverage.out
-	go test -coverprofile=coverage.out -mod vendor -timeout=1m -v -short ./...
+	go test -coverprofile=coverage.out -timeout=1m -v -short ./...
 
 clean:
 	rm -rf bin/

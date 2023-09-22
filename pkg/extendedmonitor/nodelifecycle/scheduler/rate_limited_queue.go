@@ -18,12 +18,13 @@ package scheduler
 
 import (
 	"container/heap"
-	"k8s.io/klog"
 	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/flowcontrol"
+
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -33,8 +34,6 @@ const (
 	// NodeEvictionPeriod controls how often NodeController will try to
 	// evict Pods from non-responsive Nodes.
 	NodeEvictionPeriod = 100 * time.Millisecond
-	// UpdateWorkerSize defines the size of workers for node update or/and pod update.
-	UpdateWorkerSize = 8
 	// EvictionRateLimiterBurst is the burst value for all eviction rate
 	// limiters
 	EvictionRateLimiterBurst = 1

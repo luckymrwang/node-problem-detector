@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-
 	coordv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,7 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/homedir"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/node-problem-detector/cmd/options"
 	"k8s.io/node-problem-detector/pkg/exporters/k8sexporter/problemclient"
 	"k8s.io/node-problem-detector/pkg/extendedmonitor/nodelifecycle/scheduler"
@@ -233,7 +231,7 @@ func NewNodeMonitorOrDie(ctx context.Context, npdo *options.NodeProblemDetectorO
 	c := problemclient.NewClientOrDie(npdo)
 	node, err := c.GetNode(ctx)
 	if err != nil {
-		glog.Errorf("Can't get node object: %v", err)
+		klog.Errorf("Can't get node object: %v", err)
 		return
 	}
 	// This node monitor is just running on the master.
@@ -246,11 +244,11 @@ func NewNodeMonitorOrDie(ctx context.Context, npdo *options.NodeProblemDetectorO
 	uri, _ := url.Parse("https://127.0.0.1:6443")
 	cfg, err := getKubeClientConfig(uri)
 	if err != nil {
-		glog.Fatalf("Failed to get client config: %v", err)
+		klog.Errorf("Failed to get client config: %v", err)
 	}
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		glog.Fatalf("Failed to create kubernetes client: %v", err)
+		klog.Errorf("Failed to create kubernetes client: %v", err)
 	}
 
 	sharedInformers := informers.NewSharedInformerFactory(clientset, defaultResync)
@@ -263,7 +261,7 @@ func NewNodeMonitorOrDie(ctx context.Context, npdo *options.NodeProblemDetectorO
 		npdo.NodeMonitorGracePeriod,
 	)
 	if err != nil {
-		glog.Errorf("Failed to get lifecycle controller: %v", err)
+		klog.Errorf("Failed to get lifecycle controller: %v", err)
 		return
 	}
 	klog.Infof("Starting node lifecycle monitor")
@@ -449,7 +447,7 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 				return true, nil
 			}
 			name := node.Name
-			node, err = nc.kubeClient.CoreV1().Nodes().Get(name, metav1.GetOptions{})
+			node, err = nc.kubeClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
 				klog.Errorf("Failed while getting a Node to retry updating node health. Probably Node %s was deleted.", name)
 				return false, err
@@ -816,7 +814,7 @@ func (nc *Controller) tryUpdateNodeHealth(ctx context.Context, node *v1.Node) (t
 		_, currentReadyCondition = GetNodeCondition(&node.Status, v1.NodeReady)
 
 		if !reflect.DeepEqual(currentReadyCondition, &observedReadyCondition) {
-			if _, err := nc.kubeClient.CoreV1().Nodes().UpdateStatus(node); err != nil {
+			if _, err := nc.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{}); err != nil {
 				klog.Errorf("Error updating node %s: %v", node.Name, err)
 				return gracePeriod, observedReadyCondition, currentReadyCondition, err
 			}

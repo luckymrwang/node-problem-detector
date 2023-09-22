@@ -37,6 +37,8 @@ const (
 	// EvictionRateLimiterBurst is the burst value for all eviction rate
 	// limiters
 	EvictionRateLimiterBurst = 1
+	// UpdateWorkerSize defines the size of workers for node update or/and pod update.
+	UpdateWorkerSize = 8
 )
 
 // TimedValue is a value that should be processed at a designated time.
